@@ -7,6 +7,8 @@ const DEFAULT_SETTINGS = {
   flashCutChance: 0.5,
   colorGrade: "auto",
   bypassEffects: false,
+  clipDurMin: 0.4,
+  clipDurMax: 2.0,
 };
 
 const COLOR_GRADE_LABELS = {
@@ -71,9 +73,8 @@ async function loadMediaItem(file) {
 }
 
 // ── Timeline ──────────────────────────────────────────────────────────────────
-function randomClipDuration(allowLong) {
-  if (allowLong) return 1.5 + Math.random() * 0.5;
-  return Math.random() < 0.55 ? 0.4 + Math.random() * 0.5 : 0.9 + Math.random() * 0.4;
+function randomClipDuration(min, max) {
+  return min + Math.random() * (max - min);
 }
 
 function randomPlaybackSpeed() {
@@ -169,7 +170,7 @@ function buildTimeline(items, targetDuration, settings, endScreen) {
   const clips = [];
   let totalTime = 0;
   const pool = [...mainPool].sort(() => Math.random() - 0.5);
-  let idx = 0, longBudget = 2;
+  let idx = 0;
 
   while (totalTime < mainDuration - 0.25) {
     const remaining = mainDuration - totalTime;
@@ -198,9 +199,7 @@ function buildTimeline(items, targetDuration, settings, endScreen) {
     if (isSpare(item) && (spareUsage.get(item.id) || 0) >= SPARE_CAP) break;
     if (isSpare(item)) spareUsage.set(item.id, (spareUsage.get(item.id) || 0) + 1);
 
-    const wantLong = longBudget > 0 && Math.random() < 0.15;
-    if (wantLong) longBudget--;
-    const dur = Math.min(randomClipDuration(wantLong), Math.min(2.0, remaining));
+    const dur = Math.min(randomClipDuration(settings.clipDurMin, settings.clipDurMax), remaining);
     if (dur < 0.25) break;
 
     let startTime = 0, speed = 1;
@@ -215,7 +214,9 @@ function buildTimeline(items, targetDuration, settings, endScreen) {
     clips.push({
       item, startTime, duration: dur, speed,
       effects: randomEffects(items, item, settings),
-      kenBurns: { zoom: Math.random() < 0.5 ? 1 : -1, panX: (Math.random() - 0.5) * 2, panY: (Math.random() - 0.5) * 2, cropX: pickCropX(item.id, lastCropX) },
+      kenBurns: item.type === "image"
+        ? { zoom: Math.random() < 0.5 ? 1 : -1, panX: (Math.random() - 0.5) * 2, panY: (Math.random() - 0.5) * 2, cropX: pickCropX(item.id, lastCropX) }
+        : { zoom: 0, panX: 0, panY: 0, cropX: pickCropX(item.id, lastCropX) },
     });
     totalTime += dur;
     if (idx % pool.length === 0) pool.sort(() => Math.random() - 0.5);
@@ -470,7 +471,12 @@ async function renderReel(clips, w, h, onProgress, onLog, audioFile, hardCapMs, 
       const deItem = fx.doubleExposure._item || allItems.find(i => i.element === fx.doubleExposure.source);
       if (deItem) {
         const src = deItem.type === "image" ? await freshImg(deItem) : await freshVid(deItem);
-        fx = { ...fx, doubleExposure: { ...fx.doubleExposure, source: src } };
+        let deStartTime = 0;
+        if (deItem.type === "video" && deItem.duration > 0 && isFinite(deItem.duration)) {
+          const avail = deItem.duration - clip.duration - 0.1;
+          deStartTime = avail > 0 ? Math.random() * avail : 0;
+        }
+        fx = { ...fx, doubleExposure: { ...fx.doubleExposure, source: src, _isVideo: deItem.type === "video", _deStartTime: deStartTime } };
       } else {
         fx = { ...fx, doubleExposure: null };
       }
@@ -489,12 +495,20 @@ async function renderReel(clips, w, h, onProgress, onLog, audioFile, hardCapMs, 
       timestamp += frameDur; framesDone++;
     }
 
+    const seekDE = async f => {
+      if (fx.doubleExposure?._isVideo) {
+        fx.doubleExposure.source.currentTime = fx.doubleExposure._deStartTime + f / FPS;
+        await waitForSeek(fx.doubleExposure.source);
+      }
+    };
+
     if (clip.item.type === "video") {
       const vid = await freshVid(clip.item);
       const speed = clip.speed ?? 1;
       for (let f = 0; f < clipFrames; f++) {
         vid.currentTime = clip.startTime + (f / FPS) * speed;
         await waitForSeek(vid);
+        await seekDE(f);
         if (!bypassEffects) ctx.filter = fx.colorFilter;
         drawCover(ctx, vid, w, h, { cropX: clip.kenBurns?.cropX ?? 0.5 });
         ctx.filter = "none";
@@ -509,6 +523,7 @@ async function renderReel(clips, w, h, onProgress, onLog, audioFile, hardCapMs, 
       const img = await freshImg(clip.item);
       for (let f = 0; f < clipFrames; f++) {
         const progress = f / clipFrames;
+        await seekDE(f);
         if (!bypassEffects) ctx.filter = fx.colorFilter;
         drawCover(ctx, img, w, h, { ...clip.kenBurns, progress });
         ctx.filter = "none";
@@ -589,13 +604,93 @@ function Slider({ label, hint, value, onChange, disabled }) {
   return (
     <div style={{ display:"flex", flexDirection:"column", gap:6 }}>
       <div style={{ display:"flex", justifyContent:"space-between" }}>
-        <span style={{ fontSize:10, textTransform:"uppercase", letterSpacing:"0.12em", color:"rgba(255,255,255,0.45)" }}>{label}</span>
-        <span style={{ fontSize:9, fontFamily:"monospace", color:"rgba(255,255,255,0.28)" }}>{pct}%</span>
+        <span style={{ fontSize:12, textTransform:"uppercase", letterSpacing:"0.12em", color:"rgba(255,255,255,0.8)" }}>{label}</span>
+        <span style={{ fontSize:11, fontFamily:"monospace", color:"rgba(255,255,255,0.65)" }}>{pct}%</span>
       </div>
       <input type="range" min={0} max={100} value={pct} disabled={disabled}
         onChange={e => onChange(Number(e.target.value) / 100)}
         style={{ width:"100%", accentColor:"#e63030", opacity: disabled ? 0.3 : 1 }} />
-      <span style={{ fontSize:9, color:"rgba(255,255,255,0.2)" }}>{hint}</span>
+      <span style={{ fontSize:11, color:"rgba(255,255,255,0.5)" }}>{hint}</span>
+    </div>
+  );
+}
+
+function ClipDurationRange({ min, max, onMinChange, onMaxChange, disabled }) {
+  const RMIN = 0.25, RMAX = 5.0, STEP = 0.25;
+  const trackRef = useRef(null);
+  const dragging = useRef(null);
+  const state = useRef({ min, max, onMinChange, onMaxChange });
+  state.current = { min, max, onMinChange, onMaxChange };
+
+  const snap = v => Math.round(v / STEP) * STEP;
+  const pctOf = v => ((v - RMIN) / (RMAX - RMIN)) * 100;
+  const valueFromClientX = clientX => {
+    const rect = trackRef.current?.getBoundingClientRect();
+    if (!rect) return null;
+    return snap(Math.max(RMIN, Math.min(RMAX, RMIN + ((clientX - rect.left) / rect.width) * (RMAX - RMIN))));
+  };
+
+  useEffect(() => {
+    const onMove = e => {
+      if (!dragging.current) return;
+      const clientX = e.touches ? e.touches[0].clientX : e.clientX;
+      const v = valueFromClientX(clientX);
+      if (v === null) return;
+      const { min, max, onMinChange, onMaxChange } = state.current;
+      if (dragging.current === "min") onMinChange(Math.min(v, max));
+      else onMaxChange(Math.max(v, min));
+    };
+    const onUp = () => { dragging.current = null; };
+    document.addEventListener("mousemove", onMove);
+    document.addEventListener("mouseup", onUp);
+    document.addEventListener("touchmove", onMove, { passive: true });
+    document.addEventListener("touchend", onUp);
+    return () => {
+      document.removeEventListener("mousemove", onMove);
+      document.removeEventListener("mouseup", onUp);
+      document.removeEventListener("touchmove", onMove);
+      document.removeEventListener("touchend", onUp);
+    };
+  }, []); // stable — reads state via ref
+
+  const minPct = pctOf(min);
+  const maxPct = pctOf(max);
+
+  const thumb = (left, isMin) => (
+    <div
+      onMouseDown={e => { if (!disabled) { e.preventDefault(); dragging.current = isMin ? "min" : "max"; }}}
+      onTouchStart={e => { if (!disabled) { dragging.current = isMin ? "min" : "max"; }}}
+      style={{ position:"absolute", left: left + "%", top:"50%",
+        width:18, height:18, borderRadius:"50%",
+        transform:"translate(-50%,-50%)",
+        background: isMin ? "#e63030" : "#fff",
+        cursor: disabled ? "default" : "grab",
+        boxShadow: isMin ? "0 0 0 4px rgba(230,48,48,0.22)" : "0 1px 5px rgba(0,0,0,0.55)",
+        zIndex:2, touchAction:"none" }} />
+  );
+
+  return (
+    <div style={{ gridColumn:"1 / -1", display:"flex", flexDirection:"column", gap:8 }}>
+      <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center" }}>
+        <span style={{ fontSize:12, textTransform:"uppercase", letterSpacing:"0.12em", color:"rgba(255,255,255,0.8)" }}>Clip Duration</span>
+        <div style={{ display:"flex", gap:8, alignItems:"center", fontFamily:"monospace", fontSize:12 }}>
+          <span style={{ color:"#e63030", background:"rgba(230,48,48,0.14)", padding:"3px 8px", borderRadius:3 }}>{min}s</span>
+          <span style={{ color:"rgba(255,255,255,0.45)" }}>–</span>
+          <span style={{ color:"rgba(255,255,255,0.85)", background:"rgba(255,255,255,0.1)", padding:"3px 8px", borderRadius:3 }}>{max}s</span>
+        </div>
+      </div>
+
+      <div ref={trackRef} style={{ position:"relative", height:28, opacity: disabled ? 0.35 : 1 }}>
+        <div style={{ position:"absolute", top:"50%", left:0, right:0, height:3, transform:"translateY(-50%)", background:"rgba(255,255,255,0.12)", borderRadius:999, pointerEvents:"none" }} />
+        <div style={{ position:"absolute", top:"50%", left: minPct + "%", width: (maxPct - minPct) + "%", height:3, transform:"translateY(-50%)", background:"#e63030", borderRadius:999, pointerEvents:"none" }} />
+        {thumb(minPct, true)}
+        {thumb(maxPct, false)}
+      </div>
+
+      <div style={{ display:"flex", justifyContent:"space-between" }}>
+        <span style={{ fontSize:11, color:"rgba(255,255,255,0.45)" }}>0.25s</span>
+        <span style={{ fontSize:11, color:"rgba(255,255,255,0.45)" }}>5s</span>
+      </div>
     </div>
   );
 }
@@ -603,14 +698,14 @@ function Slider({ label, hint, value, onChange, disabled }) {
 function PresetGrid({ value, onChange, disabled }) {
   return (
     <div style={{ display:"flex", flexDirection:"column", gap:8 }}>
-      <span style={{ fontSize:10, textTransform:"uppercase", letterSpacing:"0.1em", color:"rgba(255,255,255,0.28)" }}>Color Grade</span>
+      <span style={{ fontSize:12, textTransform:"uppercase", letterSpacing:"0.1em", color:"rgba(255,255,255,0.65)" }}>Color Grade</span>
       <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr", gap:6 }}>
         {PRESETS.map(p => (
           <button key={p} disabled={disabled} onClick={() => onChange(p)}
-            style={{ padding:"8px", fontSize:10, textTransform:"uppercase", letterSpacing:"0.08em", borderRadius:2, border:"none",
+            style={{ padding:"8px", fontSize:12, textTransform:"uppercase", letterSpacing:"0.08em", borderRadius:2, border:"none",
               cursor: disabled ? "not-allowed" : "pointer", textAlign:"left", lineHeight:1.2, transition:"all 0.15s",
               background: value === p ? "#e63030" : "rgba(255,255,255,0.06)",
-              color: value === p ? "white" : "rgba(255,255,255,0.4)", opacity: disabled ? 0.3 : 1 }}>
+              color: value === p ? "white" : "rgba(255,255,255,0.65)", opacity: disabled ? 0.3 : 1 }}>
             {COLOR_GRADE_LABELS[p]}
           </button>
         ))}
@@ -808,7 +903,7 @@ export default function ReelMaker() {
     left:    { flex:1, display:"flex", flexDirection:"column", padding:28, gap:20, minWidth:280, overflowY:"auto" },
     effects: { width:240, borderLeft:"1px solid rgba(255,255,255,0.08)", display:"flex", flexDirection:"column" },
     log:     { width:200, borderLeft:"1px solid rgba(255,255,255,0.08)", display:"flex", flexDirection:"column" },
-    phdr:    { padding:"16px 20px", borderBottom:"1px solid rgba(255,255,255,0.08)", fontSize:10, textTransform:"uppercase", letterSpacing:"0.12em", color:"rgba(255,255,255,0.28)" },
+    phdr:    { padding:"16px 20px", borderBottom:"1px solid rgba(255,255,255,0.08)", fontSize:12, textTransform:"uppercase", letterSpacing:"0.12em", color:"rgba(255,255,255,0.65)" },
     pbody:   { flex:1, overflowY:"auto", padding:20 },
   };
 
@@ -816,7 +911,7 @@ export default function ReelMaker() {
     <div style={C.root}>
       <header style={C.header}>
         <h1 style={{ margin:0, fontSize:22, fontWeight:700, letterSpacing:"0.12em", textTransform:"uppercase", color:"white" }}>Reel Maker</h1>
-        <p style={{ margin:"4px 0 0", fontSize:11, color:"rgba(255,255,255,0.3)", letterSpacing:"0.1em" }}>
+        <p style={{ margin:"4px 0 0", fontSize:13, color:"rgba(255,255,255,0.6)", letterSpacing:"0.1em" }}>
           1080×1920 · fast cuts · rock treatment{audioDuration ? " · " + fmt(audioDuration) + " with audio" : " · 30s"}
         </p>
       </header>
@@ -837,8 +932,8 @@ export default function ReelMaker() {
             <input ref={mediaInput} type="file" multiple accept="video/*,image/*" style={{ display:"none" }}
               onChange={e => { if (e.target.files) { handleMediaFiles(Array.from(e.target.files)); e.target.value=""; } }} />
             <div style={{ fontSize:28, opacity:0.22 }}>⊕</div>
-            <div style={{ fontSize:13, color:"rgba(255,255,255,0.42)", letterSpacing:"0.08em" }}>Drop videos &amp; images</div>
-            <div style={{ fontSize:10, color:"rgba(255,255,255,0.22)" }}>MP4 · MOV · WEBM · JPG · PNG</div>
+            <div style={{ fontSize:14, color:"rgba(255,255,255,0.72)", letterSpacing:"0.08em" }}>Drop videos &amp; images</div>
+            <div style={{ fontSize:12, color:"rgba(255,255,255,0.5)" }}>MP4 · MOV · WEBM · JPG · PNG</div>
           </div>
 
           {/* Audio drop zone */}
@@ -856,14 +951,14 @@ export default function ReelMaker() {
             <div style={{ fontSize:18, opacity:0.38 }}>♪</div>
             <div style={{ flex:1, minWidth:0 }}>
               {audioFile ? (
-                <><div style={{ fontSize:11, overflow:"hidden", whiteSpace:"nowrap", textOverflow:"ellipsis", color:"rgba(251,191,36,0.8)" }}>{audioFile.name}</div>
-                  <div style={{ fontSize:10, color:"rgba(255,255,255,0.3)", marginTop:2 }}>{audioDuration ? fmt(audioDuration) + " · will match video length" : "…"}</div></>
+                <><div style={{ fontSize:13, overflow:"hidden", whiteSpace:"nowrap", textOverflow:"ellipsis", color:"rgba(251,191,36,0.9)" }}>{audioFile.name}</div>
+                  <div style={{ fontSize:12, color:"rgba(255,255,255,0.6)", marginTop:2 }}>{audioDuration ? fmt(audioDuration) + " · will match video length" : "…"}</div></>
               ) : (
-                <><div style={{ fontSize:11, color:"rgba(255,255,255,0.38)" }}>Drop audio track (optional)</div>
-                  <div style={{ fontSize:10, color:"rgba(255,255,255,0.2)" }}>WAV · MP3 · AAC</div></>
+                <><div style={{ fontSize:13, color:"rgba(255,255,255,0.65)" }}>Drop audio track (optional)</div>
+                  <div style={{ fontSize:12, color:"rgba(255,255,255,0.5)" }}>WAV · MP3 · AAC</div></>
               )}
             </div>
-            {audioFile && <button onClick={e => { e.stopPropagation(); setAudioFile(null); setAudioDuration(null); dbDelete("audio").catch(console.error); }} style={{ background:"none", border:"none", color:"rgba(255,255,255,0.28)", cursor:"pointer", fontSize:20 }}>×</button>}
+            {audioFile && <button onClick={e => { e.stopPropagation(); setAudioFile(null); setAudioDuration(null); dbDelete("audio").catch(console.error); }} style={{ background:"none", border:"none", color:"rgba(255,255,255,0.55)", cursor:"pointer", fontSize:20 }}>×</button>}
           </div>
 
           {/* End screen drop zone */}
@@ -881,24 +976,24 @@ export default function ReelMaker() {
             <div style={{ fontSize:18, opacity:0.38 }}>⊡</div>
             <div style={{ flex:1, minWidth:0 }}>
               {endScreenItem ? (
-                <><div style={{ fontSize:11, overflow:"hidden", whiteSpace:"nowrap", textOverflow:"ellipsis", color:"rgba(139,92,246,0.85)" }}>{endScreenItem.file.name}</div>
-                  <div style={{ fontSize:10, color:"rgba(255,255,255,0.3)", marginTop:2 }}>
+                <><div style={{ fontSize:13, overflow:"hidden", whiteSpace:"nowrap", textOverflow:"ellipsis", color:"rgba(167,139,250,0.95)" }}>{endScreenItem.file.name}</div>
+                  <div style={{ fontSize:12, color:"rgba(255,255,255,0.6)", marginTop:2 }}>
                     {endScreenItem.type === "video" ? fmt(endScreenItem.duration ?? 0) : END_SCREEN_SECS + "s"} · end screen · no effects
                   </div></>
               ) : (
-                <><div style={{ fontSize:11, color:"rgba(255,255,255,0.38)" }}>End screen (optional)</div>
-                  <div style={{ fontSize:10, color:"rgba(255,255,255,0.2)" }}>Last frame · image or video · no effects applied</div></>
+                <><div style={{ fontSize:13, color:"rgba(255,255,255,0.65)" }}>End screen (optional)</div>
+                  <div style={{ fontSize:12, color:"rgba(255,255,255,0.5)" }}>Last frame · image or video · no effects applied</div></>
               )}
             </div>
-            {endScreenItem && <button onClick={e => { e.stopPropagation(); removeEndScreen(); }} disabled={busy} style={{ background:"none", border:"none", color:"rgba(255,255,255,0.28)", cursor:"pointer", fontSize:20 }}>×</button>}
+            {endScreenItem && <button onClick={e => { e.stopPropagation(); removeEndScreen(); }} disabled={busy} style={{ background:"none", border:"none", color:"rgba(255,255,255,0.55)", cursor:"pointer", fontSize:20 }}>×</button>}
           </div>
 
           {/* File list */}
           {items.length > 0 && (
             <div>
-              <div style={{ fontSize:10, color:"rgba(255,255,255,0.26)", textTransform:"uppercase", letterSpacing:"0.1em", marginBottom:4, display:"flex", justifyContent:"space-between", alignItems:"center" }}>
+              <div style={{ fontSize:12, color:"rgba(255,255,255,0.62)", textTransform:"uppercase", letterSpacing:"0.1em", marginBottom:4, display:"flex", justifyContent:"space-between", alignItems:"center" }}>
                 <span>{items.length} file{items.length !== 1 ? "s" : ""}{totalSrc > 0 && " · " + fmt(totalSrc) + " source"}</span>
-                <button onClick={clearAllMedia} disabled={busy} style={{ background:"none", border:"none", fontSize:9, textTransform:"uppercase", letterSpacing:"0.1em", color:"rgba(255,255,255,0.25)", cursor:"pointer", padding:0, opacity: busy ? 0.2 : 1 }}>Clear all</button>
+                <button onClick={clearAllMedia} disabled={busy} style={{ background:"none", border:"none", fontSize:11, textTransform:"uppercase", letterSpacing:"0.1em", color:"rgba(255,255,255,0.55)", cursor:"pointer", padding:0, opacity: busy ? 0.2 : 1 }}>Clear all</button>
               </div>
               <div style={{ display:"flex", flexDirection:"column", gap:4, maxHeight:160, overflowY:"auto" }}>
                 {items.map(item => (
@@ -907,12 +1002,12 @@ export default function ReelMaker() {
                       {item.type === "image" ? <img src={item.url} alt="" style={{ width:"100%", height:"100%", objectFit:"cover" }} /> : <video src={item.url} style={{ width:"100%", height:"100%", objectFit:"cover" }} muted />}
                     </div>
                     <div style={{ flex:1, minWidth:0 }}>
-                      <div style={{ fontSize:11, overflow:"hidden", whiteSpace:"nowrap", textOverflow:"ellipsis", color: item.glitch ? "rgba(168,85,247,0.9)" : isSpare(item) ? "rgba(255,200,100,0.85)" : "rgba(255,255,255,0.7)" }}>{item.file.name}</div>
-                      <div style={{ fontSize:9, color:"rgba(255,255,255,0.28)", marginTop:2 }}>
+                      <div style={{ fontSize:13, overflow:"hidden", whiteSpace:"nowrap", textOverflow:"ellipsis", color: item.glitch ? "rgba(192,132,252,0.95)" : isSpare(item) ? "rgba(255,210,120,0.95)" : "rgba(255,255,255,0.85)" }}>{item.file.name}</div>
+                      <div style={{ fontSize:11, color:"rgba(255,255,255,0.55)", marginTop:2 }}>
                         {item.glitch
-                          ? <span style={{ color:"rgba(168,85,247,0.6)" }}>glitch · flash/double-exposure only</span>
+                          ? <span style={{ color:"rgba(192,132,252,0.75)" }}>glitch · flash/double-exposure only</span>
                           : isSpare(item)
-                          ? <span style={{ color:"rgba(255,200,100,0.5)" }}>spare · max {SPARE_CAP}× · {item.type === "video" ? "video · " + fmt(item.duration ?? 0) : "image"}</span>
+                          ? <span style={{ color:"rgba(255,210,120,0.7)" }}>spare · max {SPARE_CAP}× · {item.type === "video" ? "video · " + fmt(item.duration ?? 0) : "image"}</span>
                           : item.type === "video" ? "video · " + fmt(item.duration ?? 0) : "image"}
                       </div>
                     </div>
@@ -925,30 +1020,30 @@ export default function ReelMaker() {
 
           {/* Quality toggle */}
           <div style={{ display:"flex", alignItems:"center", gap:8 }}>
-            <span style={{ fontSize:10, textTransform:"uppercase", letterSpacing:"0.1em", color:"rgba(255,255,255,0.28)", flexShrink:0 }}>Quality</span>
+            <span style={{ fontSize:12, textTransform:"uppercase", letterSpacing:"0.1em", color:"rgba(255,255,255,0.65)", flexShrink:0 }}>Quality</span>
             {["low","high"].map(q => (
               <button key={q} onClick={() => setQuality(q)} disabled={busy}
-                style={{ padding:"5px 12px", fontSize:10, textTransform:"uppercase", letterSpacing:"0.08em", borderRadius:2, border:"none", cursor: busy ? "not-allowed" : "pointer", transition:"all 0.15s", opacity: busy ? 0.4 : 1,
+                style={{ padding:"5px 12px", fontSize:12, textTransform:"uppercase", letterSpacing:"0.08em", borderRadius:2, border:"none", cursor: busy ? "not-allowed" : "pointer", transition:"all 0.15s", opacity: busy ? 0.4 : 1,
                   background: quality === q ? (q === "low" ? "rgba(251,191,36,0.18)" : "#e63030") : "rgba(255,255,255,0.06)",
-                  color: quality === q ? (q === "low" ? "rgba(251,191,36,0.9)" : "white") : "rgba(255,255,255,0.35)" }}>
+                  color: quality === q ? (q === "low" ? "rgba(251,191,36,0.9)" : "white") : "rgba(255,255,255,0.6)" }}>
                 {q === "low" ? "540p" : "1080p"}
               </button>
             ))}
-            <span style={{ fontSize:9, color:"rgba(255,255,255,0.18)" }}>{quality === "low" ? "540×960 · fast" : "1080×1920 · final"}</span>
+            <span style={{ fontSize:11, color:"rgba(255,255,255,0.5)" }}>{quality === "low" ? "540×960 · fast" : "1080×1920 · final"}</span>
           </div>
 
           {/* Buttons */}
           <div style={{ display:"flex", gap:8 }}>
             <button onClick={() => runRender(true)} disabled={!canAct}
-              style={{ flexShrink:0, padding:"12px 16px", fontSize:11, fontWeight:"bold", textTransform:"uppercase", letterSpacing:"0.1em", borderRadius:2, border:"none", transition:"all 0.15s",
-                cursor: canAct ? "pointer" : "not-allowed", background:"rgba(255,255,255,0.1)", color:"rgba(255,255,255,0.6)", opacity: canAct ? 1 : 0.3 }}>
+              style={{ flexShrink:0, padding:"12px 16px", fontSize:13, fontWeight:"bold", textTransform:"uppercase", letterSpacing:"0.1em", borderRadius:2, border:"none", transition:"all 0.15s",
+                cursor: canAct ? "pointer" : "not-allowed", background:"rgba(255,255,255,0.1)", color:"rgba(255,255,255,0.75)", opacity: canAct ? 1 : 0.3 }}>
               {isRendering && isPreview ? "▷ " + progress + "%" : "▷ " + PREVIEW_SECS + "s"}
             </button>
             <button onClick={() => runRender(false)} disabled={!canAct || (isRendering && isPreview === false)}
               style={{ flex:1, padding:"12px 0", fontSize:13, fontWeight:"bold", textTransform:"uppercase", letterSpacing:"0.1em", borderRadius:2, border:"none", transition:"all 0.15s",
                 cursor: canAct ? "pointer" : "not-allowed",
                 background: canAct && !(isRendering && !isPreview) ? "#e63030" : "rgba(255,255,255,0.05)",
-                color: canAct && !(isRendering && !isPreview) ? "white" : "rgba(255,255,255,0.18)" }}>
+                color: canAct && !(isRendering && !isPreview) ? "white" : "rgba(255,255,255,0.4)" }}>
               {isRendering && !isPreview ? "Rendering… " + progress + "%" : isLoading ? "Loading…" : audioDuration ? "Generate · " + fmt(audioDuration) : "Generate · " + (quality === "low" ? "540p" : "1080p")}
             </button>
           </div>
@@ -962,7 +1057,7 @@ export default function ReelMaker() {
           {/* Result */}
           {status === "done" && downloadUrl && (
             <div style={{ display:"flex", flexDirection:"column", gap:12 }}>
-              {isPreview && <div style={{ fontSize:9, textTransform:"uppercase", letterSpacing:"0.1em", color:"rgba(255,255,255,0.25)", textAlign:"center" }}>preview · 270×480 · 8s</div>}
+              {isPreview && <div style={{ fontSize:11, textTransform:"uppercase", letterSpacing:"0.1em", color:"rgba(255,255,255,0.55)", textAlign:"center" }}>preview · 270×480 · 8s</div>}
               {playerOk && previewSrc ? (
                 <video
                   key={previewSrc}
@@ -1035,11 +1130,11 @@ export default function ReelMaker() {
           <div style={{ ...C.phdr, display:"flex", alignItems:"center", justifyContent:"space-between" }}>
             <span>Effects</span>
             <button onClick={() => setSetting("bypassEffects")(!settings.bypassEffects)} disabled={busy}
-              style={{ fontSize:9, textTransform:"uppercase", letterSpacing:"0.1em", padding:"3px 10px", borderRadius:2, border:"1px solid", fontFamily:"inherit",
+              style={{ fontSize:11, textTransform:"uppercase", letterSpacing:"0.1em", padding:"3px 10px", borderRadius:2, border:"1px solid", fontFamily:"inherit",
                 cursor: busy ? "not-allowed" : "pointer", opacity: busy ? 0.3 : 1,
-                borderColor: settings.bypassEffects ? "rgba(255,255,255,0.2)" : "rgba(230,48,48,0.35)",
+                borderColor: settings.bypassEffects ? "rgba(255,255,255,0.3)" : "rgba(230,48,48,0.5)",
                 background: settings.bypassEffects ? "rgba(255,255,255,0.06)" : "rgba(230,48,48,0.08)",
-                color: settings.bypassEffects ? "rgba(255,255,255,0.45)" : "rgba(230,48,48,0.75)" }}>
+                color: settings.bypassEffects ? "rgba(255,255,255,0.65)" : "rgba(230,48,48,0.9)" }}>
               {settings.bypassEffects ? "bypassed" : "active"}
             </button>
           </div>
@@ -1052,9 +1147,10 @@ export default function ReelMaker() {
               <Slider label="Light Leaks"     hint="Warm flare frequency"           value={settings.lightLeakFreq}        onChange={setSetting("lightLeakFreq")}        disabled={busy} />
               <Slider label="Double Exposure" hint="Chance of blending two sources" value={settings.doubleExposureChance} onChange={setSetting("doubleExposureChance")} disabled={busy} />
               <Slider label="Flash Cuts"      hint="Flash frame at transitions"     value={settings.flashCutChance}       onChange={setSetting("flashCutChance")}       disabled={busy} />
+              <ClipDurationRange min={settings.clipDurMin} max={settings.clipDurMax} onMinChange={setSetting("clipDurMin")} onMaxChange={setSetting("clipDurMax")} disabled={busy} />
             </div>
             <button onClick={() => setSettings(DEFAULT_SETTINGS)} disabled={busy}
-              style={{ background:"none", border:"none", fontSize:10, textTransform:"uppercase", letterSpacing:"0.1em", color:"rgba(255,255,255,0.22)", cursor:"pointer", opacity: busy ? 0.25 : 1, alignSelf:"flex-end" }}>
+              style={{ background:"none", border:"none", fontSize:12, textTransform:"uppercase", letterSpacing:"0.1em", color:"rgba(255,255,255,0.5)", cursor:"pointer", opacity: busy ? 0.25 : 1, alignSelf:"flex-end" }}>
               Reset to defaults
             </button>
           </div>
@@ -1064,9 +1160,9 @@ export default function ReelMaker() {
         {/* Log panel */}
         <div style={C.log}>
           <div style={C.phdr}>Log</div>
-          <div style={{ ...C.pbody, fontFamily:"monospace", fontSize:10, lineHeight:1.6, color:"rgba(255,255,255,0.3)" }}>
-            {logs.length === 0 ? <span style={{ color:"rgba(255,255,255,0.16)" }}>Nothing yet…</span>
-              : logs.map((l, i) => <div key={i} style={{ marginBottom:2 }}><span style={{ color:"rgba(255,255,255,0.16)" }}>&gt; </span>{l}</div>)}
+          <div style={{ ...C.pbody, fontFamily:"monospace", fontSize:11, lineHeight:1.6, color:"rgba(255,255,255,0.65)" }}>
+            {logs.length === 0 ? <span style={{ color:"rgba(255,255,255,0.4)" }}>Nothing yet…</span>
+              : logs.map((l, i) => <div key={i} style={{ marginBottom:2 }}><span style={{ color:"rgba(255,255,255,0.35)" }}>&gt; </span>{l}</div>)}
             <div ref={logsEnd} />
           </div>
         </div>
