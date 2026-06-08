@@ -134,7 +134,7 @@ function buildTimeline(items, targetDuration, settings, endScreen) {
     : 0;
   const mainDuration = targetDuration - endDur;
   const endClip = endScreen
-    ? { item: endScreen, startTime: 0, duration: endDur, effects: EMPTY_EFFECTS, kenBurns: { zoom: 0, panX: 0, panY: 0 } }
+    ? { item: endScreen, startTime: 0, duration: endDur, effects: EMPTY_EFFECTS, kenBurns: { zoom: 0, panX: 0, panY: 0 }, isEndScreen: true }
     : null;
   const lastCropX = new Map();
   const spareUsage = new Map();
@@ -307,6 +307,42 @@ function drawCover(ctx, source, w, h, kb) {
   ctx.drawImage(source, dx, dy, dw, dh);
 }
 
+// ── drawFill ──────────────────────────────────────────────────────────────────
+// Blurred-background fill: dim cover behind, contained source centered on top.
+function drawFill(ctx, source, w, h, colorFilter) {
+  let srcW, srcH;
+  if (source instanceof ImageBitmap) { srcW = source.width; srcH = source.height; }
+  else if (source instanceof HTMLVideoElement) { srcW = source.videoWidth || w; srcH = source.videoHeight || h; }
+  else { srcW = source.naturalWidth || w; srcH = source.naturalHeight || h; }
+
+  // Background: cover-scale × 1.15 so blur halo doesn't show at edges
+  const bgScale = Math.max(w / srcW, h / srcH) * 1.15;
+  const bgW = srcW * bgScale, bgH = srcH * bgScale;
+  ctx.filter = "blur(28px) saturate(1.3) brightness(0.6)";
+  ctx.drawImage(source, (w - bgW) / 2, (h - bgH) / 2, bgW, bgH);
+
+  // Foreground: contain-scale, centered, with optional color grade filter
+  const fgScale = Math.min(w / srcW, h / srcH);
+  const fgW = srcW * fgScale, fgH = srcH * fgScale;
+  ctx.filter = colorFilter || "none";
+  ctx.drawImage(source, (w - fgW) / 2, (h - fgH) / 2, fgW, fgH);
+  ctx.filter = "none";
+}
+
+// ── drawContain ───────────────────────────────────────────────────────────────
+// Letterbox: black background, source scaled to fit with no crop.
+function drawContain(ctx, source, w, h) {
+  let srcW, srcH;
+  if (source instanceof ImageBitmap) { srcW = source.width; srcH = source.height; }
+  else if (source instanceof HTMLVideoElement) { srcW = source.videoWidth || w; srcH = source.videoHeight || h; }
+  else { srcW = source.naturalWidth || w; srcH = source.naturalHeight || h; }
+  ctx.fillStyle = "#000";
+  ctx.fillRect(0, 0, w, h);
+  const scale = Math.min(w / srcW, h / srcH);
+  const fw = srcW * scale, fh = srcH * scale;
+  ctx.drawImage(source, (w - fw) / 2, (h - fh) / 2, fw, fh);
+}
+
 // ── waitForSeek ───────────────────────────────────────────────────────────────
 function waitForSeek(video) {
   return new Promise(resolve => {
@@ -360,7 +396,7 @@ async function pickVideoCodec(w, h, bitrate) {
   return candidates[0];
 }
 
-async function renderReel(clips, w, h, onProgress, onLog, audioFile, hardCapMs, bitrate, bypassEffects) {
+async function renderReel(clips, w, h, onProgress, onLog, audioFile, hardCapMs, bitrate, bypassEffects, fillMode) {
   bitrate = bitrate || 8_000_000;
   onLog("Loading encoder…");
   const { Muxer, ArrayBufferTarget } = await loadMp4Muxer();
@@ -509,9 +545,15 @@ async function renderReel(clips, w, h, onProgress, onLog, audioFile, hardCapMs, 
         vid.currentTime = clip.startTime + (f / FPS) * speed;
         await waitForSeek(vid);
         await seekDE(f);
-        if (!bypassEffects) ctx.filter = fx.colorFilter;
-        drawCover(ctx, vid, w, h, { cropX: clip.kenBurns?.cropX ?? 0.5 });
-        ctx.filter = "none";
+        if (clip.isEndScreen) {
+          drawContain(ctx, vid, w, h);
+        } else if (fillMode === "fill") {
+          drawFill(ctx, vid, w, h, bypassEffects ? null : fx.colorFilter);
+        } else {
+          if (!bypassEffects) ctx.filter = fx.colorFilter;
+          drawCover(ctx, vid, w, h, { cropX: clip.kenBurns?.cropX ?? 0.5 });
+          ctx.filter = "none";
+        }
         if (!bypassEffects) applyEffects(ctx, w, h, fx);
         const bmp = await createImageBitmap(offscreen);
         const vf = new VideoFrame(bmp, { timestamp, duration: frameDur });
@@ -524,9 +566,15 @@ async function renderReel(clips, w, h, onProgress, onLog, audioFile, hardCapMs, 
       for (let f = 0; f < clipFrames; f++) {
         const progress = f / clipFrames;
         await seekDE(f);
-        if (!bypassEffects) ctx.filter = fx.colorFilter;
-        drawCover(ctx, img, w, h, { ...clip.kenBurns, progress });
-        ctx.filter = "none";
+        if (clip.isEndScreen) {
+          drawContain(ctx, img, w, h);
+        } else if (fillMode === "fill") {
+          drawFill(ctx, img, w, h, bypassEffects ? null : fx.colorFilter);
+        } else {
+          if (!bypassEffects) ctx.filter = fx.colorFilter;
+          drawCover(ctx, img, w, h, { ...clip.kenBurns, progress });
+          ctx.filter = "none";
+        }
         if (!bypassEffects) applyEffects(ctx, w, h, fx);
         const bmp = await createImageBitmap(offscreen);
         const vf = new VideoFrame(bmp, { timestamp, duration: frameDur });
@@ -733,6 +781,8 @@ export default function ReelMaker() {
   const [endScreenDragging, setEndScreenDragging] = useState(false);
   const [settings, setSettings]         = useState(DEFAULT_SETTINGS);
   const [quality, setQuality]           = useState("high");
+  const [aspectRatio, setAspectRatio]   = useState("9:16");
+  const [fillMode, setFillMode]         = useState("cover");
   const [isPreview, setIsPreview]       = useState(false);
 
   const mediaInput     = useRef(null);
@@ -745,8 +795,12 @@ export default function ReelMaker() {
     (async () => {
       const s = storageGet("reel:settings");
       const q = storageGet("reel:quality");
+      const a = storageGet("reel:aspect");
       if (s) { try { setSettings(prev => ({ ...prev, ...JSON.parse(s) })); } catch {} }
       if (q) setQuality(q === "low" ? "low" : "high");
+      if (a === "16:9" || a === "9:16") setAspectRatio(a);
+      const f = storageGet("reel:fill");
+      if (f === "cover" || f === "fill") setFillMode(f);
       try {
         const records = await dbGetAll();
         const mediaRecords = records.filter(r => !r.isAudio && !r.isEndScreen).sort((a, b) => (a.created || 0) - (b.created || 0));
@@ -777,9 +831,11 @@ export default function ReelMaker() {
     persistTimer.current = setTimeout(() => {
       storageSet("reel:settings", JSON.stringify(settings));
       storageSet("reel:quality", quality);
+      storageSet("reel:aspect", aspectRatio);
+      storageSet("reel:fill", fillMode);
     }, 700);
     return () => clearTimeout(persistTimer.current);
-  }, [settings, quality]);
+  }, [settings, quality, aspectRatio, fillMode]);
 
   useEffect(() => { logsEnd.current?.scrollIntoView({ behavior:"smooth" }); }, [logs]);
   useEffect(() => () => { if (objUrlRef.current) URL.revokeObjectURL(objUrlRef.current); }, []);
@@ -848,8 +904,9 @@ export default function ReelMaker() {
   const runRender = useCallback(async (preview) => {
     if (!items.length) return;
     const isHigh = quality === "high" && !preview;
-    const w = preview ? 270 : (isHigh ? 1080 : 540);
-    const h = preview ? 480 : (isHigh ? 1920 : 960);
+    const isVertical = aspectRatio === "9:16";
+    const w = preview ? (isVertical ? 270 : 480) : (isHigh ? (isVertical ? 1080 : 1920) : (isVertical ? 540 : 960));
+    const h = preview ? (isVertical ? 480 : 270) : (isHigh ? (isVertical ? 1920 : 1080) : (isVertical ? 960 : 540));
     const dur = preview ? PREVIEW_SECS : (audioDuration ?? 30);
     const br  = preview ? 800_000 : (isHigh ? 8_000_000 : 2_500_000);
 
@@ -863,7 +920,7 @@ export default function ReelMaker() {
     addLog(clips.length + " clips · avg " + (clips.reduce((s,c) => s+c.duration,0) / clips.length).toFixed(2) + "s");
 
     try {
-      const blob = await renderReel(clips, w, h, p => setProgress(Math.round(p*100)), addLog, preview ? null : audioFile, preview ? undefined : (audioDuration ? audioDuration * 1000 : undefined), br, settings.bypassEffects);
+      const blob = await renderReel(clips, w, h, p => setProgress(Math.round(p*100)), addLog, preview ? null : audioFile, preview ? undefined : (audioDuration ? audioDuration * 1000 : undefined), br, settings.bypassEffects, fillMode);
       // Download path first — this is the guaranteed one and must not depend on the preview.
       const url = URL.createObjectURL(blob);
       objUrlRef.current = url;
@@ -888,7 +945,7 @@ export default function ReelMaker() {
     } catch(e) {
       setStatus("error"); addLog("Render failed: " + e.message);
     }
-  }, [items, settings, quality, audioDuration, audioFile, endScreenItem, addLog]);
+  }, [items, settings, quality, aspectRatio, fillMode, audioDuration, audioFile, endScreenItem, addLog]);
 
   const isRendering = status === "rendering";
   const isLoading   = status === "loading" || audioLoading;
@@ -912,7 +969,7 @@ export default function ReelMaker() {
       <header style={C.header}>
         <h1 style={{ margin:0, fontSize:22, fontWeight:700, letterSpacing:"0.12em", textTransform:"uppercase", color:"white" }}>Reel Maker</h1>
         <p style={{ margin:"4px 0 0", fontSize:13, color:"rgba(255,255,255,0.6)", letterSpacing:"0.1em" }}>
-          1080×1920 · fast cuts · rock treatment{audioDuration ? " · " + fmt(audioDuration) + " with audio" : " · 30s"}
+          {aspectRatio === "9:16" ? "1080×1920" : "1920×1080"} · fast cuts · rock treatment{audioDuration ? " · " + fmt(audioDuration) + " with audio" : " · 30s"}
         </p>
       </header>
 
@@ -1018,18 +1075,52 @@ export default function ReelMaker() {
             </div>
           )}
 
-          {/* Quality toggle */}
-          <div style={{ display:"flex", alignItems:"center", gap:8 }}>
-            <span style={{ fontSize:12, textTransform:"uppercase", letterSpacing:"0.1em", color:"rgba(255,255,255,0.65)", flexShrink:0 }}>Quality</span>
-            {["low","high"].map(q => (
-              <button key={q} onClick={() => setQuality(q)} disabled={busy}
-                style={{ padding:"5px 12px", fontSize:12, textTransform:"uppercase", letterSpacing:"0.08em", borderRadius:2, border:"none", cursor: busy ? "not-allowed" : "pointer", transition:"all 0.15s", opacity: busy ? 0.4 : 1,
-                  background: quality === q ? (q === "low" ? "rgba(251,191,36,0.18)" : "#e63030") : "rgba(255,255,255,0.06)",
-                  color: quality === q ? (q === "low" ? "rgba(251,191,36,0.9)" : "white") : "rgba(255,255,255,0.6)" }}>
-                {q === "low" ? "540p" : "1080p"}
-              </button>
-            ))}
-            <span style={{ fontSize:11, color:"rgba(255,255,255,0.5)" }}>{quality === "low" ? "540×960 · fast" : "1080×1920 · final"}</span>
+          {/* Quality + aspect ratio toggles */}
+          <div style={{ display:"flex", flexDirection:"column", gap:8 }}>
+            <div style={{ display:"flex", alignItems:"center", gap:8 }}>
+              <span style={{ fontSize:12, textTransform:"uppercase", letterSpacing:"0.1em", color:"rgba(255,255,255,0.65)", flexShrink:0, width:60 }}>Quality</span>
+              {["low","high"].map(q => (
+                <button key={q} onClick={() => setQuality(q)} disabled={busy}
+                  style={{ padding:"5px 12px", fontSize:12, textTransform:"uppercase", letterSpacing:"0.08em", borderRadius:2, border:"none", cursor: busy ? "not-allowed" : "pointer", transition:"all 0.15s", opacity: busy ? 0.4 : 1,
+                    background: quality === q ? (q === "low" ? "rgba(251,191,36,0.18)" : "#e63030") : "rgba(255,255,255,0.06)",
+                    color: quality === q ? (q === "low" ? "rgba(251,191,36,0.9)" : "white") : "rgba(255,255,255,0.6)" }}>
+                  {q === "low" ? "540p" : "1080p"}
+                </button>
+              ))}
+              <span style={{ fontSize:11, color:"rgba(255,255,255,0.5)" }}>
+                {quality === "low"
+                  ? (aspectRatio === "9:16" ? "540×960" : "960×540") + " · fast"
+                  : (aspectRatio === "9:16" ? "1080×1920" : "1920×1080") + " · final"}
+              </span>
+            </div>
+            <div style={{ display:"flex", alignItems:"center", gap:8 }}>
+              <span style={{ fontSize:12, textTransform:"uppercase", letterSpacing:"0.1em", color:"rgba(255,255,255,0.65)", flexShrink:0, width:60 }}>Format</span>
+              {["9:16","16:9"].map(ar => (
+                <button key={ar} onClick={() => setAspectRatio(ar)} disabled={busy}
+                  style={{ padding:"5px 12px", fontSize:12, textTransform:"uppercase", letterSpacing:"0.08em", borderRadius:2, border:"none", cursor: busy ? "not-allowed" : "pointer", transition:"all 0.15s", opacity: busy ? 0.4 : 1,
+                    background: aspectRatio === ar ? "#e63030" : "rgba(255,255,255,0.06)",
+                    color: aspectRatio === ar ? "white" : "rgba(255,255,255,0.6)" }}>
+                  {ar}
+                </button>
+              ))}
+              <span style={{ fontSize:11, color:"rgba(255,255,255,0.5)" }}>
+                {aspectRatio === "9:16" ? "vertical · reels / stories" : "horizontal · widescreen"}
+              </span>
+            </div>
+            <div style={{ display:"flex", alignItems:"center", gap:8 }}>
+              <span style={{ fontSize:12, textTransform:"uppercase", letterSpacing:"0.1em", color:"rgba(255,255,255,0.65)", flexShrink:0, width:60 }}>Fill</span>
+              {["cover","fill"].map(m => (
+                <button key={m} onClick={() => setFillMode(m)} disabled={busy}
+                  style={{ padding:"5px 12px", fontSize:12, textTransform:"uppercase", letterSpacing:"0.08em", borderRadius:2, border:"none", cursor: busy ? "not-allowed" : "pointer", transition:"all 0.15s", opacity: busy ? 0.4 : 1,
+                    background: fillMode === m ? "#e63030" : "rgba(255,255,255,0.06)",
+                    color: fillMode === m ? "white" : "rgba(255,255,255,0.6)" }}>
+                  {m === "cover" ? "Cover" : "Color fill"}
+                </button>
+              ))}
+              <span style={{ fontSize:11, color:"rgba(255,255,255,0.5)" }}>
+                {fillMode === "cover" ? "crop to frame" : "blur bg · no crop"}
+              </span>
+            </div>
           </div>
 
           {/* Buttons */}
@@ -1057,7 +1148,9 @@ export default function ReelMaker() {
           {/* Result */}
           {status === "done" && downloadUrl && (
             <div style={{ display:"flex", flexDirection:"column", gap:12 }}>
-              {isPreview && <div style={{ fontSize:11, textTransform:"uppercase", letterSpacing:"0.1em", color:"rgba(255,255,255,0.55)", textAlign:"center" }}>preview · 270×480 · 8s</div>}
+              {isPreview && <div style={{ fontSize:11, textTransform:"uppercase", letterSpacing:"0.1em", color:"rgba(255,255,255,0.55)", textAlign:"center" }}>
+                preview · {aspectRatio === "9:16" ? "270×480" : "480×270"} · 8s
+              </div>}
               {playerOk && previewSrc ? (
                 <video
                   key={previewSrc}
@@ -1068,7 +1161,10 @@ export default function ReelMaker() {
                     addLog("Player error" + (err ? " · code " + err.code : "") + (err && err.message ? " · " + err.message : ""));
                     setPlayerOk(false);
                   }}
-                  style={{ borderRadius:2, background:"black", margin:"0 auto", display:"block", maxHeight:340, aspectRatio:"9/16", width:"100%" }} />
+                  style={{ borderRadius:2, background:"black", margin:"0 auto", display:"block",
+                    ...(aspectRatio === "9:16"
+                      ? { maxHeight:340, aspectRatio:"9/16", width:"auto" }
+                      : { maxWidth:"100%", aspectRatio:"16/9", width:"100%" }) }} />
               ) : (
                 <div style={{ borderRadius:2, border:"1px dashed rgba(255,255,255,0.16)", padding:"24px 16px", textAlign:"center", fontSize:11, lineHeight:1.6, color:"rgba(255,255,255,0.5)" }}>
                   Inline preview is blocked by this sandbox's media policy.<br />
